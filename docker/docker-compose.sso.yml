@@ -1,34 +1,199 @@
-# Lab 04 — SSO Integration: jitsi with Keycloak OIDC authentication
----
-services:
-  jitsi:
-    image: jitsi/web:stable
-    container_name: it-stack-jitsi
-    restart: unless-stopped
-    ports:
-      - "443:$firstPort"
-    environment:
-      - IT_STACK_ENV=lab-04-sso
-      - KEYCLOAK_URL=
-      - KEYCLOAK_REALM=
-      - KEYCLOAK_CLIENT_ID=jitsi
-      - KEYCLOAK_CLIENT_SECRET=
-    networks:
-      - it-stack-net
+# docker-compose.sso.yml — Lab 08-04: SSO Integration
+# Jitsi with Keycloak as JWT token authority (OIDC → Jitsi JWT bridge)
+name: jitsi-sso
 
-  # Local Keycloak for SSO lab (replace with lab-id1 in real env)
+services:
   keycloak:
-    image: quay.io/keycloak/keycloak:24
-    container_name: it-stack-jitsi-keycloak
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: jitsi-sso-keycloak
     command: start-dev
     environment:
       KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
+      KEYCLOAK_ADMIN_PASSWORD: Lab04Admin!
+      KC_HTTP_PORT: "8080"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KC_PROXY: edge
     ports:
-      - "8080:8080"
+      - "8086:8080"
     networks:
-      - it-stack-net
+      - jitsi-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready | grep -q UP"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+    restart: unless-stopped
+
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: jitsi-sso-coturn
+    command: >
+      -n
+      --log-file=stdout
+      --lt-cred-mech
+      --fingerprint
+      --realm=lab.local
+      --user=jitsi:TurnPass1!
+      --no-multicast-peers
+      --cli-password=TurnCliPass1!
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+    networks:
+      - turn-net
+      - jitsi-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    restart: unless-stopped
+
+  prosody:
+    image: jitsi/prosody:stable-9753
+    container_name: jitsi-sso-prosody
+    environment:
+      AUTH_TYPE: jwt
+      ENABLE_AUTH: 1
+      ENABLE_GUESTS: 1
+      APP_ID: jitsi
+      APP_SECRET: JitsiSSO04!
+      JWT_ALLOW_EMPTY: 0
+      JWT_ENABLE_DOMAIN_VERIFICATION: "true"
+      JWT_ASAP_KEYSERVER: "http://keycloak:8080/realms/it-stack/protocol/openid-connect/certs"
+      JWT_ACCEPTED_ISSUERS: "keycloak,localhost"
+      JWT_ACCEPTED_AUDIENCES: "jitsi"
+      JICOFO_COMPONENT_SECRET: s3cr3t
+      JICOFO_AUTH_PASSWORD: JicofoPass04!
+      JVB_AUTH_PASSWORD: JvbPass04!
+      JIGASI_XMPP_PASSWORD: JigasiPass04!
+      JIBRI_RECORDER_PASSWORD: JibriPass04!
+      JIBRI_XMPP_PASSWORD: JibriXmppPass04!
+      XMPP_DOMAIN: lab.local
+      XMPP_AUTH_DOMAIN: auth.lab.local
+      XMPP_GUEST_DOMAIN: guest.lab.local
+      XMPP_MUC_DOMAIN: muc.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.lab.local
+      XMPP_MODULES: ""
+      XMPP_MUC_MODULES: ""
+      XMPP_INTERNAL_MUC_MODULES: ""
+      LOG_LEVEL: warn
+      TZ: UTC
+    networks:
+      - jitsi-net
+    depends_on:
+      - keycloak
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    restart: unless-stopped
+
+  jicofo:
+    image: jitsi/jicofo:stable-9753
+    container_name: jitsi-sso-jicofo
+    environment:
+      AUTH_TYPE: jwt
+      ENABLE_AUTH: 1
+      JICOFO_COMPONENT_SECRET: s3cr3t
+      JICOFO_AUTH_PASSWORD: JicofoPass04!
+      JVB_AUTH_PASSWORD: JvbPass04!
+      XMPP_DOMAIN: lab.local
+      XMPP_AUTH_DOMAIN: auth.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.lab.local
+      XMPP_SERVER: prosody
+      TZ: UTC
+    networks:
+      - jitsi-net
+    depends_on:
+      - prosody
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    restart: unless-stopped
+
+  jvb:
+    image: jitsi/jvb:stable-9753
+    container_name: jitsi-sso-jvb
+    ports:
+      - "10000:10000/udp"
+      - "4443:4443"
+    environment:
+      JVB_AUTH_PASSWORD: JvbPass04!
+      JVB_PORT: 10000
+      JVB_TCP_HARVESTER_DISABLED: "true"
+      XMPP_AUTH_DOMAIN: auth.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.lab.local
+      XMPP_SERVER: prosody
+      JVB_STUN_SERVERS: ""
+      DOCKER_HOST_ADDRESS: "127.0.0.1"
+      TZ: UTC
+    networks:
+      - jitsi-net
+    depends_on:
+      - prosody
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    restart: unless-stopped
+
+  web:
+    image: jitsi/web:stable-9753
+    container_name: jitsi-sso-web
+    ports:
+      - "8443:443"
+      - "8180:80"
+    environment:
+      AUTH_TYPE: jwt
+      ENABLE_AUTH: 1
+      ENABLE_GUESTS: 1
+      APP_ID: jitsi
+      APP_SECRET: JitsiSSO04!
+      TOKEN_AUTH_URL: "http://keycloak:8080/realms/it-stack/protocol/openid-connect/auth?client_id=jitsi&response_type=code&scope=openid+email+profile&redirect_uri=https://localhost:8443/{room}"
+      XMPP_DOMAIN: lab.local
+      XMPP_AUTH_DOMAIN: auth.lab.local
+      XMPP_GUEST_DOMAIN: guest.lab.local
+      XMPP_MUC_DOMAIN: muc.lab.local
+      XMPP_BOSH_URL_BASE: "http://prosody:5280"
+      TZ: UTC
+      ENABLE_COLIBRI_WEBSOCKET: 1
+      ENABLE_TURN_SERVER: 1
+      TURN_CREDENTIALS: "jitsi:TurnPass1!"
+      TURN_HOST: coturn
+      TURN_PORT: 3478
+    volumes:
+      - jitsi_sso_web:/config
+    networks:
+      - jitsi-net
+      - turn-net
+    depends_on:
+      - prosody
+      - jicofo
+      - jvb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    restart: unless-stopped
+
+volumes:
+  jitsi_sso_web:
 
 networks:
-  it-stack-net:
-    driver: bridge
+  jitsi-net:
+  turn-net:
