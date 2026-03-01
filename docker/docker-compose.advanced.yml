@@ -1,34 +1,164 @@
-# Lab 03 — Advanced Features: jitsi with TLS, resource limits, logging
----
+# docker-compose.advanced.yml — Lab 08-03: Advanced Features
+# Jitsi with JWT authentication, coturn TURN server, and resource limits
+name: jitsi-advanced
+
 services:
-  jitsi:
-    image: jitsi/web:stable
-    container_name: it-stack-jitsi
-    restart: unless-stopped
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: jitsi-adv-coturn
+    command: >
+      -n
+      --log-file=stdout
+      --lt-cred-mech
+      --fingerprint
+      --realm=lab.local
+      --user=jitsi:TurnPass1!
+      --no-multicast-peers
+      --cli-password=TurnCliPass1!
     ports:
-      - "443:$firstPort"
-    environment:
-      - IT_STACK_ENV=lab-03-advanced
-      - TLS_ENABLED=true
-    volumes:
-      - jitsi_data:/var/lib/jitsi
-      - ./certs:/etc/ssl/certs:ro
+      - "3478:3478"
+      - "3478:3478/udp"
+    networks:
+      - turn-net
+      - jitsi-net
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: G
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
-    networks:
-      - it-stack-net
+          cpus: "0.25"
+          memory: 128M
+    restart: unless-stopped
 
-networks:
-  it-stack-net:
-    driver: bridge
+  prosody:
+    image: jitsi/prosody:stable-9753
+    container_name: jitsi-adv-prosody
+    environment:
+      AUTH_TYPE: jwt
+      ENABLE_AUTH: 1
+      ENABLE_GUESTS: 1
+      APP_ID: jitsi
+      APP_SECRET: JitsiJWT03!
+      JWT_ALLOW_EMPTY: 0
+      JWT_ENABLE_DOMAIN_VERIFICATION: "true"
+      JICOFO_COMPONENT_SECRET: s3cr3t
+      JICOFO_AUTH_PASSWORD: JicofoPass03!
+      JVB_AUTH_PASSWORD: JvbPass03!
+      JIGASI_XMPP_PASSWORD: JigasiPass03!
+      JIBRI_RECORDER_PASSWORD: JibriPass03!
+      JIBRI_XMPP_PASSWORD: JibriXmppPass03!
+      XMPP_DOMAIN: lab.local
+      XMPP_AUTH_DOMAIN: auth.lab.local
+      XMPP_GUEST_DOMAIN: guest.lab.local
+      XMPP_MUC_DOMAIN: muc.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.lab.local
+      XMPP_MODULES: ""
+      XMPP_MUC_MODULES: ""
+      XMPP_INTERNAL_MUC_MODULES: ""
+      LOG_LEVEL: warn
+      TZ: UTC
+    networks:
+      - jitsi-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    restart: unless-stopped
+
+  jicofo:
+    image: jitsi/jicofo:stable-9753
+    container_name: jitsi-adv-jicofo
+    environment:
+      AUTH_TYPE: jwt
+      ENABLE_AUTH: 1
+      JICOFO_COMPONENT_SECRET: s3cr3t
+      JICOFO_AUTH_PASSWORD: JicofoPass03!
+      JVB_AUTH_PASSWORD: JvbPass03!
+      XMPP_DOMAIN: lab.local
+      XMPP_AUTH_DOMAIN: auth.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.lab.local
+      XMPP_SERVER: prosody
+      TZ: UTC
+    networks:
+      - jitsi-net
+    depends_on:
+      - prosody
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    restart: unless-stopped
+
+  jvb:
+    image: jitsi/jvb:stable-9753
+    container_name: jitsi-adv-jvb
+    ports:
+      - "10000:10000/udp"
+      - "4443:4443"
+    environment:
+      JVB_AUTH_PASSWORD: JvbPass03!
+      JVB_PORT: 10000
+      JVB_TCP_HARVESTER_DISABLED: "true"
+      XMPP_AUTH_DOMAIN: auth.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.lab.local
+      XMPP_SERVER: prosody
+      JVB_STUN_SERVERS: ""
+      DOCKER_HOST_ADDRESS: "127.0.0.1"
+      TZ: UTC
+    networks:
+      - jitsi-net
+    depends_on:
+      - prosody
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    restart: unless-stopped
+
+  web:
+    image: jitsi/web:stable-9753
+    container_name: jitsi-adv-web
+    ports:
+      - "8443:443"
+      - "8180:80"
+    environment:
+      AUTH_TYPE: jwt
+      ENABLE_AUTH: 1
+      ENABLE_GUESTS: 1
+      APP_ID: jitsi
+      APP_SECRET: JitsiJWT03!
+      TOKEN_AUTH_URL: "https://localhost:8443/{room}"
+      XMPP_DOMAIN: lab.local
+      XMPP_AUTH_DOMAIN: auth.lab.local
+      XMPP_GUEST_DOMAIN: guest.lab.local
+      XMPP_MUC_DOMAIN: muc.lab.local
+      XMPP_BOSH_URL_BASE: "http://prosody:5280"
+      TZ: UTC
+      ENABLE_COLIBRI_WEBSOCKET: 1
+      ENABLE_TURN_SERVER: 1
+      TURN_CREDENTIALS: "jitsi:TurnPass1!"
+      TURN_HOST: coturn
+      TURN_PORT: 3478
+    volumes:
+      - jitsi_adv_web:/config
+    networks:
+      - jitsi-net
+      - turn-net
+    depends_on:
+      - prosody
+      - jicofo
+      - jvb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    restart: unless-stopped
 
 volumes:
-  jitsi_data:
+  jitsi_adv_web:
+
+networks:
+  jitsi-net:
+  turn-net:
