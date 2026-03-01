@@ -1,71 +1,116 @@
 #!/usr/bin/env bash
-# test-lab-08-06.sh — Lab 08-06: Production Deployment
-# Module 08: Jitsi video conferencing
-# jitsi in production-grade HA configuration with monitoring
+# test-lab-08-06.sh — Jitsi Lab 06: Production Deployment
+# Module 08 | Lab 06 | Tests: resource limits, restart=always, volumes, JWT, metrics
 set -euo pipefail
 
-LAB_ID="08-06"
-LAB_NAME="Production Deployment"
-MODULE="jitsi"
-COMPOSE_FILE="docker/docker-compose.production.yml"
-PASS=0
-FAIL=0
+COMPOSE_FILE="$(dirname "$0")/../docker/docker-compose.production.yml"
+CLEANUP=true
+for arg in "$@"; do [[ "$arg" == "--no-cleanup" ]] && CLEANUP=false; done
 
-# ── Colors ────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; NC='\033[0m'
+KC_PORT=8207
+WEB_PORT=8250
+TRAEFIK_PORT=8280
+TRAEFIK_DASH=8209
+KC_ADMIN_PASS="Prod06Admin!"
 
-pass() { echo -e "${GREEN}[PASS]${NC} $1"; ((PASS++)); }
-fail() { echo -e "${RED}[FAIL]${NC} $1"; ((FAIL++)); }
-info() { echo -e "${CYAN}[INFO]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+PASS=0; FAIL=0
+pass() { echo "[PASS] $1"; ((PASS++)) || true; }
+fail() { echo "[FAIL] $1"; ((FAIL++)) || true; }
+section() { echo ""; echo "=== $1 ==="; }
 
-echo -e "${CYAN}======================================${NC}"
-echo -e "${CYAN} Lab ${LAB_ID}: ${LAB_NAME}${NC}"
-echo -e "${CYAN} Module: ${MODULE}${NC}"
-echo -e "${CYAN}======================================${NC}"
-echo ""
+cleanup() {
+  if [[ "$CLEANUP" == "true" ]]; then
+    echo "Cleaning up..."
+    docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
-# ── PHASE 1: Setup ────────────────────────────────────────────────────────────
-info "Phase 1: Setup"
-docker compose -f "${COMPOSE_FILE}" up -d
-info "Waiting 30s for ${MODULE} to initialize..."
-sleep 30
+section "Starting Lab 06 Production Deployment"
+docker compose -f "$COMPOSE_FILE" up -d
+echo "Waiting for services to initialize..."
 
-# ── PHASE 2: Health Checks ────────────────────────────────────────────────────
-info "Phase 2: Health Checks"
+section "Health Checks"
+for i in $(seq 1 60); do
+  status=$(docker inspect jitsi-prod-keycloak --format '{{.State.Health.Status}}' 2>/dev/null || echo "waiting")
+  [[ "$status" == "healthy" ]] && break; sleep 5
+done
+[[ "$(docker inspect jitsi-prod-keycloak --format '{{.State.Health.Status}}')" == "healthy" ]] && pass "Keycloak healthy" || fail "Keycloak not healthy"
 
-if docker compose -f "${COMPOSE_FILE}" ps | grep -q "running\|Up"; then
-    pass "Container is running"
+for i in $(seq 1 60); do
+  status=$(docker inspect jitsi-prod-prosody --format '{{.State.Health.Status}}' 2>/dev/null || echo "waiting")
+  [[ "$status" == "healthy" ]] && break; sleep 5
+done
+[[ "$(docker inspect jitsi-prod-prosody --format '{{.State.Health.Status}}')" == "healthy" ]] && pass "Prosody healthy" || fail "Prosody not healthy"
+
+for i in $(seq 1 60); do
+  status=$(docker inspect jitsi-prod-web --format '{{.State.Health.Status}}' 2>/dev/null || echo "waiting")
+  [[ "$status" == "healthy" ]] && break; sleep 5
+done
+[[ "$(docker inspect jitsi-prod-web --format '{{.State.Health.Status}}')" == "healthy" ]] && pass "Jitsi web healthy" || fail "Jitsi web not healthy"
+
+section "Production Configuration Checks"
+# Restart policy
+for ctr in jitsi-prod-keycloak jitsi-prod-web jitsi-prod-jvb jitsi-prod-prosody; do
+  rp=$(docker inspect "$ctr" --format '{{.HostConfig.RestartPolicy.Name}}')
+  [[ "$rp" == "always" ]] && pass "$ctr restart=always" || fail "$ctr restart policy is '$rp'"
+done
+
+# Resource limits
+for ctr in jitsi-prod-keycloak jitsi-prod-web jitsi-prod-jvb; do
+  mem=$(docker inspect "$ctr" --format '{{.HostConfig.Memory}}')
+  [[ "$mem" -gt 0 ]] && pass "$ctr memory limit set ($mem bytes)" || fail "$ctr memory limit not set"
+done
+
+# Named volumes
+for vol in jitsi-prod-prosody jitsi-prod-jicofo jitsi-prod-jvb jitsi-prod-web; do
+  docker volume ls | grep -q "$vol" && pass "Volume $vol exists" || fail "Volume $vol missing"
+done
+
+section "Traefik Dashboard"
+curl -sf "http://localhost:${TRAEFIK_DASH}/api/rawdata" | grep -q "routers" && pass "Traefik API returning router data" || fail "Traefik dashboard not responding"
+
+section "Keycloak API & Metrics"
+TOKEN=$(curl -sf -X POST "http://localhost:${KC_PORT}/realms/master/protocol/openid-connect/token" \
+  -d "client_id=admin-cli&grant_type=password&username=admin&password=${KC_ADMIN_PASS}" \
+  | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+[[ -n "$TOKEN" ]] && pass "Keycloak admin token obtained" || fail "Keycloak admin token failed"
+
+REALM_EXISTS=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://localhost:${KC_PORT}/admin/realms" | grep -o '"realm":"it-stack"' | wc -l || echo 0)
+if [[ "$REALM_EXISTS" -gt 0 ]]; then
+  pass "Realm it-stack exists"
 else
-    fail "Container is not running"
+  curl -sf -X POST "http://localhost:${KC_PORT}/admin/realms" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"realm":"it-stack","enabled":true,"displayName":"IT-Stack Production"}'
+  pass "Realm it-stack created"
 fi
 
-# ── PHASE 3: Functional Tests ─────────────────────────────────────────────────
-info "Phase 3: Functional Tests (Lab 06 — Production Deployment)"
+CLIENT_EXISTS=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://localhost:${KC_PORT}/admin/realms/it-stack/clients?clientId=jitsi-client" | grep -o '"clientId":"jitsi-client"' | wc -l || echo 0)
+if [[ "$CLIENT_EXISTS" -gt 0 ]]; then
+  pass "OIDC client jitsi-client exists"
+else
+  curl -sf -X POST "http://localhost:${KC_PORT}/admin/realms/it-stack/clients" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"clientId":"jitsi-client","enabled":true,"protocol":"openid-connect","publicClient":true,"redirectUris":["http://localhost:'"${WEB_PORT}"'/*"]}'
+  pass "OIDC client jitsi-client created"
+fi
 
-# TODO: Add module-specific functional tests here
-# Example:
-# if curl -sf http://localhost:443/health > /dev/null 2>&1; then
-#     pass "Health endpoint responds"
-# else
-#     fail "Health endpoint not reachable"
-# fi
+curl -sf "http://localhost:${KC_PORT}/metrics" | grep -q "keycloak" && pass "Keycloak /metrics endpoint returns data" || fail "Keycloak /metrics not responding"
 
-warn "Functional tests for Lab 08-06 pending implementation"
+section "Jitsi JWT Environment"
+jwt_secret=$(docker inspect jitsi-prod-web --format '{{range .Config.Env}}{{println .}}{{end}}' | grep JWT_APP_SECRET | cut -d= -f2)
+[[ "$jwt_secret" == "JitsiProd06!" ]] && pass "JWT_APP_SECRET set correctly" || fail "JWT_APP_SECRET not set (got: $jwt_secret)"
 
-# ── PHASE 4: Cleanup ──────────────────────────────────────────────────────────
-info "Phase 4: Cleanup"
-docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans
-info "Cleanup complete"
+section "Jitsi Web UI"
+curl -sf "http://localhost:${WEB_PORT}/" | grep -qi "jitsi" && pass "Jitsi web UI responding" || fail "Jitsi web UI not reachable"
 
-# ── Results ───────────────────────────────────────────────────────────────────
+section "Log Rotation Configuration"
+log_driver=$(docker inspect jitsi-prod-web --format '{{.HostConfig.LogConfig.Type}}')
+[[ "$log_driver" == "json-file" ]] && pass "Log driver is json-file" || fail "Log driver is '$log_driver'"
+
 echo ""
-echo -e "${CYAN}======================================${NC}"
-echo -e " Lab ${LAB_ID} Complete"
-echo -e " ${GREEN}PASS: ${PASS}${NC} | ${RED}FAIL: ${FAIL}${NC}"
-echo -e "${CYAN}======================================${NC}"
-
-if [ "${FAIL}" -gt 0 ]; then
-    exit 1
-fi
+echo "================================================"
+echo "Lab 06 Results: ${PASS} passed, ${FAIL} failed"
+echo "================================================"
+[[ $FAIL -eq 0 ]] && exit 0 || exit 1

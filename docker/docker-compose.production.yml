@@ -1,53 +1,242 @@
-# Lab 06 — Production: jitsi HA-ready with monitoring and external volumes
----
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-jitsi-prod-jwt: &jitsi-prod-jwt
+  JWT_AUTH_TYPE: token
+  JWT_TOKEN_AUTH_MODULE: token
+  JWT_APP_ID: jitsi-meet
+  JWT_APP_SECRET: JitsiProd06!
+  JWT_ACCEPTED_ISSUERS: jitsi-meet
+  JWT_ACCEPTED_AUDIENCES: jitsi-meet
+
 services:
-  jitsi:
-    image: jitsi/web:stable
-    container_name: it-stack-jitsi
+  jitsi-prod-traefik:
+    image: traefik:v3.0
+    container_name: jitsi-prod-traefik
     restart: always
+    command:
+      - --api.insecure=true
+      - --providers.docker=true
+      - --providers.docker.exposedByDefault=false
+      - --entrypoints.web.address=:80
     ports:
-      - "443:$firstPort"
-    environment:
-      - IT_STACK_ENV=production
-      - KEYCLOAK_URL=
-      - DB_HOST=
-      - REDIS_HOST=
-      - GRAYLOG_HOST=
+      - "8280:80"
+      - "8209:8080"
     volumes:
-      - jitsi_data:/var/lib/jitsi
-      - /etc/ssl/certs:/etc/ssl/certs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - jitsi-prod-net
     deploy:
-      replicas: 1
       resources:
         limits:
-          cpus: "4.0"
-          memory: G
-        reservations:
-          cpus: "1.0"
-          memory: 1G
-      restart_policy:
-        condition: any
-        delay: 5s
-    logging:
-      driver: gelf
-      options:
-        gelf-address: "udp://${GRAYLOG_HOST}:12201"
-        tag: "it-stack-jitsi"
+          memory: 256m
+          cpus: "0.5"
+    logging: *default-logging
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
-    networks:
-      - it-stack-net
+      test: ["CMD", "traefik", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-networks:
-  it-stack-net:
-    external: true
-    name: it-stack-production
+  jitsi-prod-keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: jitsi-prod-keycloak
+    restart: always
+    command: start-dev
+    environment:
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: Prod06Admin!
+    ports:
+      - "8207:8080"
+    networks:
+      - jitsi-prod-net
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready | grep -q UP || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  jitsi-prod-coturn:
+    image: coturn/coturn:latest
+    container_name: jitsi-prod-coturn
+    restart: always
+    command: >
+      --user=jitsi:JitsiProd06!
+      --realm=lab.local
+      --fingerprint
+      --no-multicast-peers
+      --no-cli
+    ports:
+      - "3479:3478/udp"
+      - "3479:3478/tcp"
+    networks:
+      - jitsi-prod-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+    logging: *default-logging
+
+  jitsi-prod-prosody:
+    image: jitsi/prosody:stable-9286
+    container_name: jitsi-prod-prosody
+    restart: always
+    environment:
+      <<: *jitsi-prod-jwt
+      XMPP_DOMAIN: meet.lab.local
+      XMPP_AUTH_DOMAIN: auth.meet.lab.local
+      XMPP_MUC_DOMAIN: muc.meet.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.lab.local
+      JICOFO_AUTH_PASSWORD: JitsiProd06!
+      JVB_AUTH_PASSWORD: JitsiProd06!
+      JIGASI_XMPP_PASSWORD: JitsiProd06!
+      JIBRI_RECORDER_PASSWORD: JitsiProd06!
+      JIBRI_XMPP_PASSWORD: JitsiProd06!
+      TZ: UTC
+    volumes:
+      - jitsi-prod-prosody:/config
+    networks:
+      - jitsi-prod-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "prosodyctl", "status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  jitsi-prod-jicofo:
+    image: jitsi/jicofo:stable-9286
+    container_name: jitsi-prod-jicofo
+    restart: always
+    depends_on:
+      jitsi-prod-prosody:
+        condition: service_healthy
+    environment:
+      XMPP_DOMAIN: meet.lab.local
+      XMPP_AUTH_DOMAIN: auth.meet.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.lab.local
+      XMPP_SERVER: jitsi-prod-prosody
+      JICOFO_AUTH_USER: focus
+      JICOFO_AUTH_PASSWORD: JitsiProd06!
+      JICOFO_ENABLE_HEALTH_CHECKS: "true"
+      TZ: UTC
+    volumes:
+      - jitsi-prod-jicofo:/config
+    networks:
+      - jitsi-prod-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+    logging: *default-logging
+
+  jitsi-prod-jvb:
+    image: jitsi/jvb:stable-9286
+    container_name: jitsi-prod-jvb
+    restart: always
+    depends_on:
+      jitsi-prod-prosody:
+        condition: service_healthy
+    environment:
+      XMPP_DOMAIN: meet.lab.local
+      XMPP_AUTH_DOMAIN: auth.meet.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.lab.local
+      XMPP_SERVER: jitsi-prod-prosody
+      JVB_AUTH_USER: jvb
+      JVB_AUTH_PASSWORD: JitsiProd06!
+      JVB_BREWERY_MUC: jvbbrewery
+      JVB_PORT: "10000"
+      JVB_TCP_HARVESTER_DISABLED: "true"
+      DOCKER_HOST_ADDRESS: 127.0.0.1
+      TZ: UTC
+    ports:
+      - "10002:10000/udp"
+    volumes:
+      - jitsi-prod-jvb:/config
+    networks:
+      - jitsi-prod-net
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+    logging: *default-logging
+
+  jitsi-prod-web:
+    image: jitsi/web:stable-9286
+    container_name: jitsi-prod-web
+    restart: always
+    depends_on:
+      jitsi-prod-prosody:
+        condition: service_healthy
+      jitsi-prod-jicofo:
+        condition: service_started
+      jitsi-prod-jvb:
+        condition: service_started
+    environment:
+      <<: *jitsi-prod-jwt
+      XMPP_DOMAIN: meet.lab.local
+      XMPP_AUTH_DOMAIN: auth.meet.lab.local
+      XMPP_MUC_DOMAIN: muc.meet.lab.local
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.lab.local
+      XMPP_BOSH_URL_BASE: http://jitsi-prod-prosody:5280
+      JVB_TCP_HARVESTER_DISABLED: "true"
+      ENABLE_REQUIRE_DISPLAY_NAME: "true"
+      ENABLE_GUESTS: "false"
+      TZ: UTC
+    ports:
+      - "8250:80"
+    volumes:
+      - jitsi-prod-web:/config
+      - jitsi-prod-transcripts:/usr/share/jitsi-meet/transcripts
+    networks:
+      - jitsi-prod-net
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.jitsi-prod.rule=Host(`meet.lab.local`)
+      - traefik.http.routers.jitsi-prod.entrypoints=web
+      - traefik.http.services.jitsi-prod.loadbalancer.server.port=80
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+        reservations:
+          memory: 512m
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
 
 volumes:
-  jitsi_data:
-    external: true
-    name: it-stack-jitsi-data
+  jitsi-prod-prosody:
+  jitsi-prod-jicofo:
+  jitsi-prod-jvb:
+  jitsi-prod-web:
+  jitsi-prod-transcripts:
+
+networks:
+  jitsi-prod-net:
