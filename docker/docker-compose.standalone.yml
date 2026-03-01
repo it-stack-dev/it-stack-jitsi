@@ -1,29 +1,122 @@
-# Lab 01 — Standalone: Complete Jitsi video conferencing in isolation
-# No external dependencies required.
+# Lab 01 — Standalone: Jitsi Meet video conferencing
+# Self-contained — Web + Prosody XMPP + Jicofo + JVB (video bridge)
+# Access: https://localhost:8443  (self-signed cert — use browser exception)
 ---
 services:
-  jitsi:
-    image: jitsi/web:stable
-    container_name: it-stack-jitsi
+  prosody:
+    image: jitsi/prosody:stable-9753
+    container_name: it-stack-jitsi-prosody
     restart: unless-stopped
-    ports:
-      - "443:$firstPort"
+    expose:
+      - "5222"
+      - "5269"
+      - "5347"
+      - "5280"
     environment:
-      - IT_STACK_ENV=lab-01-standalone
+      AUTH_TYPE: internal
+      ENABLE_AUTH: 1
+      ENABLE_GUESTS: 1
+      JICOFO_COMPONENT_SECRET: JicofoSecret1!
+      JICOFO_AUTH_PASSWORD: JicofoPass1!
+      JVB_AUTH_PASSWORD: JvbPass1!
+      JIGASI_XMPP_PASSWORD: JigasiPass1!
+      JIBRI_RECORDER_PASSWORD: JibriRecPass1!
+      JIBRI_XMPP_PASSWORD: JibriXmppPass1!
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_GUEST_DOMAIN: guest.meet.jitsi
+      XMPP_MUC_DOMAIN: muc.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      TZ: UTC
     volumes:
-      - jitsi_data:/var/lib/jitsi
+      - jitsi-prosody-data:/config
+    networks:
+      jitsi-standalone-net:
+        aliases:
+          - xmpp.meet.jitsi
+
+  jicofo:
+    image: jitsi/jicofo:stable-9753
+    container_name: it-stack-jitsi-jicofo
+    restart: unless-stopped
+    depends_on:
+      - prosody
+    environment:
+      AUTH_TYPE: internal
+      JICOFO_COMPONENT_SECRET: JicofoSecret1!
+      JICOFO_AUTH_PASSWORD: JicofoPass1!
+      XMPP_SERVER: xmpp.meet.jitsi
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      TZ: UTC
+    networks:
+      - jitsi-standalone-net
+
+  jvb:
+    image: jitsi/jvb:stable-9753
+    container_name: it-stack-jitsi-jvb
+    restart: unless-stopped
+    depends_on:
+      - prosody
+    ports:
+      - "10000:10000/udp"
+      - "4443:4443"
+    environment:
+      DOCKER_HOST_ADDRESS: "127.0.0.1"
+      JVB_AUTH_PASSWORD: JvbPass1!
+      XMPP_SERVER: xmpp.meet.jitsi
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      JVB_STUN_SERVERS: ""
+      TZ: UTC
+    volumes:
+      - jitsi-jvb-data:/config
+    networks:
+      - jitsi-standalone-net
+
+  web:
+    image: jitsi/web:stable-9753
+    container_name: it-stack-jitsi-web
+    restart: unless-stopped
+    depends_on:
+      - prosody
+      - jicofo
+      - jvb
+    ports:
+      - "8443:443"
+      - "8180:80"
+    environment:
+      ENABLE_AUTH: 1
+      ENABLE_GUESTS: 1
+      ENABLE_RECORDING: 0
+      ENABLE_TRANSCRIPTIONS: 0
+      PUBLIC_URL: "https://localhost:8443"
+      XMPP_SERVER: xmpp.meet.jitsi
+      XMPP_BOSH_URL_BASE: "http://xmpp.meet.jitsi:5280"
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_GUEST_DOMAIN: guest.meet.jitsi
+      XMPP_MUC_DOMAIN: muc.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      TZ: UTC
+    volumes:
+      - jitsi-web-data:/config
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sk https://localhost || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 60s
     networks:
-      - it-stack-net
+      - jitsi-standalone-net
 
 networks:
-  it-stack-net:
+  jitsi-standalone-net:
     driver: bridge
 
 volumes:
-  jitsi_data:
+  jitsi-prosody-data:
+  jitsi-jvb-data:
+  jitsi-web-data:
