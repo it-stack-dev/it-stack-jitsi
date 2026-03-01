@@ -1,26 +1,188 @@
-# Lab 05 — Advanced Integration: jitsi with full IT-Stack ecosystem
----
+# docker-compose.integration.yml -- Lab 05: Advanced Integration
+# Jitsi + Traefik reverse proxy + Keycloak JWT auth + Coturn TURN server
+# Lab 05 tests: Traefik routing, JWT via Keycloak JWKS, TURN connectivity
+#
+# Ports:
+#   8150 -- Jitsi Web (direct)
+#   8180 -- Traefik HTTP entrypoint
+#   8107 -- Keycloak admin console
+#   8109 -- Traefik dashboard
+#   10001/udp -- JVB media
+#   3478 -- Coturn STUN/TURN
+#
+# Credentials:
+#   Keycloak:  admin / Lab05Admin!
+#   OIDC:      jitsi / JitsiSSO05!
+#   Jicofo:    JicofoComp05! / JicofoAuth05!
+#   JVB:       JvbAuth05!
+#   Coturn:    TurnSecret05!
+
 services:
-  jitsi:
-    image: jitsi/web:stable
-    container_name: it-stack-jitsi
-    restart: unless-stopped
+  jitsi-int-traefik:
+    image: traefik:v3.0
+    container_name: jitsi-int-traefik
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--log.level=INFO"
     ports:
-      - "443:$firstPort"
-    environment:
-      - IT_STACK_ENV=lab-05-integration
-      - KEYCLOAK_URL=
-      - DB_HOST=
-      - REDIS_HOST=
-      - SMTP_HOST=
-      - GRAYLOG_HOST=
-    extra_hosts:
-      - "lab-id1:10.0.50.11"
-      - "lab-db1:10.0.50.12"
-      - "lab-proxy1:10.0.50.15"
+      - "8180:80"
+      - "8109:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      - it-stack-net
+      - jitsi-int-net
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  jitsi-int-keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: jitsi-int-keycloak
+    command: start-dev
+    environment:
+      KC_HEALTH_ENABLED: "true"
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: Lab05Admin!
+    ports:
+      - "8107:8080"
+    networks:
+      - jitsi-int-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready | grep -q UP || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  jitsi-int-coturn:
+    image: coturn/coturn:latest
+    container_name: jitsi-int-coturn
+    command: >
+      --lt-cred-mech
+      --fingerprint
+      --no-multicast-peers
+      --static-auth-secret=TurnSecret05!
+      --realm=jitsi-lab
+      --no-tlsv1
+      --no-tlsv1_1
+      --min-port=49152
+      --max-port=65535
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+    networks:
+      - jitsi-int-net
+      - jitsi-int-turn-net
+
+  jitsi-int-prosody:
+    image: jitsi/prosody:stable
+    container_name: jitsi-int-prosody
+    depends_on:
+      jitsi-int-keycloak:
+        condition: service_healthy
+    environment:
+      AUTH_TYPE: jwt
+      JWT_APP_ID: jitsi
+      JWT_APP_SECRET: JitsiSSO05!
+      JWT_ASAP_KEYSERVER: http://jitsi-int-keycloak:8080/realms/it-stack/protocol/openid-connect/certs
+      JWT_ACCEPTED_ISSUERS: keycloak,localhost
+      JWT_ACCEPTED_AUDIENCES: jitsi
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_MUC_DOMAIN: muc.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      XMPP_GUEST_DOMAIN: guest.meet.jitsi
+      JICOFO_COMPONENT_SECRET: JicofoComp05!
+      JICOFO_AUTH_PASSWORD: JicofoAuth05!
+      JVB_AUTH_PASSWORD: JvbAuth05!
+      ENABLE_GUESTS: "1"
+      TZ: UTC
+    networks:
+      - jitsi-int-net
+
+  jitsi-int-jicofo:
+    image: jitsi/jicofo:stable
+    container_name: jitsi-int-jicofo
+    depends_on:
+      - jitsi-int-prosody
+    environment:
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_SERVER: jitsi-int-prosody
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      JICOFO_COMPONENT_SECRET: JicofoComp05!
+      JICOFO_AUTH_PASSWORD: JicofoAuth05!
+      AUTH_TYPE: jwt
+      JWT_APP_ID: jitsi
+      TZ: UTC
+    networks:
+      - jitsi-int-net
+
+  jitsi-int-jvb:
+    image: jitsi/jvb:stable
+    container_name: jitsi-int-jvb
+    depends_on:
+      - jitsi-int-prosody
+    environment:
+      XMPP_SERVER: jitsi-int-prosody
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      JVB_AUTH_PASSWORD: JvbAuth05!
+      DOCKER_HOST_ADDRESS: 127.0.0.1
+      TZ: UTC
+    ports:
+      - "10001:10000/udp"
+    networks:
+      - jitsi-int-net
+
+  jitsi-int-web:
+    image: jitsi/web:stable
+    container_name: jitsi-int-web
+    depends_on:
+      jitsi-int-keycloak:
+        condition: service_healthy
+      jitsi-int-traefik:
+        condition: service_healthy
+    environment:
+      ENABLE_AUTH: "1"
+      AUTH_TYPE: jwt
+      JWT_APP_ID: jitsi
+      JWT_APP_SECRET: JitsiSSO05!
+      JWT_ASAP_KEYSERVER: http://jitsi-int-keycloak:8080/realms/it-stack/protocol/openid-connect/certs
+      JWT_ACCEPTED_ISSUERS: keycloak,localhost
+      JWT_ACCEPTED_AUDIENCES: jitsi
+      TOKEN_AUTH_URL: http://jitsi-int-keycloak:8080/realms/it-stack/protocol/openid-connect/auth?client_id=jitsi&response_type=code
+      ENABLE_GUESTS: "1"
+      PUBLIC_URL: http://localhost:8180
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_BOSH_URL_BASE: http://jitsi-int-prosody:5280
+      XMPP_MUC_DOMAIN: muc.meet.jitsi
+      TURN_CREDENTIALS: TurnSecret05!
+      TURN_HOST: jitsi-int-coturn
+      TURN_PORT: "3478"
+      TZ: UTC
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.jitsi-int.rule=Host(`meet.localhost`)"
+      - "traefik.http.routers.jitsi-int.entrypoints=web"
+      - "traefik.http.services.jitsi-int.loadbalancer.server.port=80"
+    ports:
+      - "8150:80"
+    networks:
+      - jitsi-int-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
 
 networks:
-  it-stack-net:
-    driver: bridge
+  jitsi-int-net:
+  jitsi-int-turn-net:
