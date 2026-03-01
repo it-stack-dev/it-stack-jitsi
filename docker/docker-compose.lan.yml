@@ -1,36 +1,170 @@
-# Lab 02 — External Dependencies: jitsi with external PostgreSQL and Redis
----
-services:
-  jitsi:
-    image: jitsi/web:stable
-    container_name: it-stack-jitsi
-    restart: unless-stopped
-    ports:
-      - "443:$firstPort"
-    environment:
-      - IT_STACK_ENV=lab-02-lan
-      - DB_HOST=
-      - DB_PORT=5432
-      - REDIS_HOST=
-    networks:
-      - it-stack-net
-
-  # Lightweight local DB for lab (replace with lab-db1 in real env)
-  postgres:
-    image: postgres:16
-    container_name: it-stack-jitsi-db
-    environment:
-      POSTGRES_DB: jitsi_db
-      POSTGRES_USER: jitsi_user
-      POSTGRES_PASSWORD: jitsi_pass
-    volumes:
-      - jitsi_pg_data:/var/lib/postgresql/data
-    networks:
-      - it-stack-net
+# =============================================================================
+# IT-Stack — Jitsi — Lab 02: External Dependencies
+# =============================================================================
+# Adds a coturn TURN/STUN server to the 4-container Jitsi stack.
+# The TURN server enables NAT traversal for clients behind firewalls/NAT,
+# which is required in any real LAN or internet deployment.
+#
+# Services:
+#   coturn  — coturn 4.6 TURN/STUN server (:3478 TCP/UDP, :5349 TLS)
+#   prosody — XMPP server (xmpp.meet.jitsi alias)
+#   jicofo  — conference focus
+#   jvb     — video bridge with TURN config (:10000/udp, :4443)
+#   web     — Jitsi Web  (:8443 HTTPS, :8180 HTTP)
+#
+# Usage:
+#   docker compose -f docker/docker-compose.lan.yml up -d
+#   docker compose -f docker/docker-compose.lan.yml down -v
+# =============================================================================
 
 networks:
-  it-stack-net:
+  jitsi-net:
+    driver: bridge
+  turn-net:
     driver: bridge
 
 volumes:
-  jitsi_pg_data:
+  jitsi-lan-prosody-config:
+  jitsi-lan-prosody-plugins:
+  jitsi-lan-jicofo-config:
+  jitsi-lan-jvb-config:
+  jitsi-lan-web-config:
+
+services:
+
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: jitsi-lan-coturn
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "5349:5349/tcp"
+      - "5349:5349/udp"
+    command: >
+      --listening-port=3478
+      --tls-listening-port=5349
+      --min-port=49152
+      --max-port=49200
+      --lt-cred-mech
+      --fingerprint
+      --realm=lab.local
+      --user=jitsi:TurnPass1!
+      --log-file=stdout
+      --no-cli
+    networks:
+      - turn-net
+      - jitsi-net
+    restart: unless-stopped
+
+  prosody:
+    image: jitsi/prosody:stable-9753
+    container_name: jitsi-lan-prosody
+    environment:
+      AUTH_TYPE: internal
+      ENABLE_AUTH: "1"
+      ENABLE_GUESTS: "1"
+      JICOFO_AUTH_PASSWORD: JicofoPass1!
+      JVB_AUTH_PASSWORD: JvbPass1!
+      JICOFO_COMPONENT_SECRET: JicofoSecret1!
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_GUEST_DOMAIN: guest.meet.jitsi
+      XMPP_MUC_DOMAIN: muc.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      TURN_HOST: coturn
+      TURN_PORT: "3478"
+      TURN_CREDENTIALS: TurnPass1!
+      TZ: UTC
+    volumes:
+      - jitsi-lan-prosody-config:/config
+      - jitsi-lan-prosody-plugins:/prosody-plugins-custom
+    networks:
+      jitsi-net:
+        aliases:
+          - xmpp.meet.jitsi
+    restart: unless-stopped
+
+  jicofo:
+    image: jitsi/jicofo:stable-9753
+    container_name: jitsi-lan-jicofo
+    environment:
+      AUTH_TYPE: internal
+      JICOFO_AUTH_PASSWORD: JicofoPass1!
+      JICOFO_COMPONENT_SECRET: JicofoSecret1!
+      XMPP_SERVER: xmpp.meet.jitsi
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      TZ: UTC
+    volumes:
+      - jitsi-lan-jicofo-config:/config
+    networks:
+      - jitsi-net
+    depends_on:
+      - prosody
+    restart: unless-stopped
+
+  jvb:
+    image: jitsi/jvb:stable-9753
+    container_name: jitsi-lan-jvb
+    ports:
+      - "10000:10000/udp"
+      - "4443:4443"
+    environment:
+      JVB_AUTH_PASSWORD: JvbPass1!
+      XMPP_SERVER: xmpp.meet.jitsi
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_INTERNAL_MUC_DOMAIN: internal-muc.meet.jitsi
+      DOCKER_HOST_ADDRESS: 127.0.0.1
+      # TURN configuration
+      JVB_STUN_SERVERS: coturn:3478
+      TURN_HOST: coturn
+      TURN_PORT: "3478"
+      TURN_CREDENTIALS: TurnPass1!
+      TZ: UTC
+    volumes:
+      - jitsi-lan-jvb-config:/config
+    networks:
+      - jitsi-net
+    depends_on:
+      - prosody
+    restart: unless-stopped
+
+  web:
+    image: jitsi/web:stable-9753
+    container_name: jitsi-lan-web
+    ports:
+      - "8443:443"
+      - "8180:80"
+    environment:
+      ENABLE_AUTH: "1"
+      ENABLE_GUESTS: "1"
+      PUBLIC_URL: https://localhost:8443
+      XMPP_SERVER: xmpp.meet.jitsi
+      XMPP_BOSH_URL_BASE: http://xmpp.meet.jitsi:5280
+      XMPP_DOMAIN: meet.jitsi
+      XMPP_AUTH_DOMAIN: auth.meet.jitsi
+      XMPP_GUEST_DOMAIN: guest.meet.jitsi
+      XMPP_MUC_DOMAIN: muc.meet.jitsi
+      JVB_TCP_HARVESTER_DISABLED: "true"
+      # TURN configuration for web clients
+      TURN_HOST: coturn
+      TURN_PORT: "3478"
+      TURN_CREDENTIALS: TurnPass1!
+      TZ: UTC
+    volumes:
+      - jitsi-lan-web-config:/config
+    networks:
+      - jitsi-net
+    depends_on:
+      - prosody
+      - jicofo
+      - jvb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk https://localhost/ -o /dev/null -w '%{http_code}' | grep -E '^(200|301|302)$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
