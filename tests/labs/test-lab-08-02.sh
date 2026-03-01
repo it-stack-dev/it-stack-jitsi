@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # test-lab-08-02.sh — Lab 08-02: External Dependencies
 # Module 08: Jitsi — coturn TURN/STUN server, separate jitsi-net + turn-net
 set -euo pipefail
